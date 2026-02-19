@@ -114,7 +114,6 @@ Interactive docs: `http://localhost:5000/docs`
 
 ## Development Notes
 
-- Uploaded files are stored in `uploads/`
 - RAG index is in-memory (rebuilds after restart)
 - Summarization and QA use retrieved context from the last processed PDF
 
