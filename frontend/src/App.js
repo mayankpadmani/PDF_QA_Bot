@@ -66,7 +66,15 @@ function App() {
     setAsking(true);
     setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: question }] } : pdf));
     try {
-      const res = await axios.post(`${API_BASE}/ask`, { question });
+      const currentPdf = pdfs.find(pdf => pdf.name === selectedPdf);
+      const formattedHistory = currentPdf.chat.map(msg => ({
+        role: msg.role === "bot" ? "assistant" : "user",
+        content: msg.text
+      }));
+      const res = await axios.post(`${API_BASE}/ask`, {
+        question,
+        history: formattedHistory
+      });
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.answer }] } : pdf));
     } catch (e) {
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error getting answer." }] } : pdf));
@@ -101,6 +109,25 @@ function App() {
       const text = chat.map(msg => `${msg.role}: ${msg.text}`).join("\n\n");
       const blob = new Blob([text], { type: "application/pdf" });
       saveAs(blob, `${selectedPdf}-chat.pdf`);
+    }
+  };
+
+  const clearChatHistory = async () => {
+  if (!selectedPdf) return;
+
+  try {
+    await axios.post(`${API_BASE}/clear-history`);
+
+    // Clear chat only for selected PDF
+    setPdfs(prev =>
+      prev.map(pdf =>
+        pdf.name === selectedPdf
+          ? { ...pdf, chat: [] }
+          : pdf
+      )
+    );
+  } catch (error) {
+    console.error("Error clearing history:", error);
     }
   };
 
@@ -208,7 +235,7 @@ function App() {
                 <Card.Body>
                   <div style={{ textAlign: "center" }}>
                     <Document file={currentPdfUrl} onLoadSuccess={onDocumentLoadSuccess}>
-                      <Page pageNumber={pageNumber} />
+                      <Page pageNumber={pageNumber} width={500}/>
                     </Document>
                     <div className="d-flex justify-content-between align-items-center mt-3">
                       <Button
@@ -240,6 +267,16 @@ function App() {
             <Card className={`${darkMode ? "bg-secondary text-light border-dark" : "bg-white text-dark border-light"} shadow`}>
               <Card.Body style={{ minHeight: 300 }}>
                 <h5 className="mb-3">💬 Chat</h5>
+                <div className="d-flex justify-content-end mb-2">
+                  <Button
+                    variant="danger"
+                    size="sm"
+                    onClick={clearChatHistory}
+                    disabled={!selectedPdf}
+                  >
+                    🗑 Clear History
+                  </Button>
+                </div>
                 <div
                   className={`chat-messages ${darkMode ? "chat-messages-dark" : "chat-messages-light"}`}
                   style={{
