@@ -4,16 +4,42 @@ const multer = require("multer");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Rate limiting middleware
+const uploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // Limit each IP to 5 upload requests per windowMs
+  message: "Too many PDF uploads from this IP, please try again after 15 minutes",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const askLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 30, // Limit each IP to 30 questions per windowMs
+  message: "Too many questions asked, please try again after 15 minutes",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const summarizeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10, // Limit each IP to 10 summarizations per windowMs
+  message: "Too many summarization requests, please try again after 15 minutes",
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 // Storage for uploaded PDFs
 const upload = multer({ dest: "uploads/" });
 
 // Route: Upload PDF
-app.post("/upload", upload.single("file"), async (req, res) => {
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
@@ -35,7 +61,7 @@ app.post("/upload", upload.single("file"), async (req, res) => {
 });
 
 // Route: Ask Question
-app.post("/ask", async (req, res) => {
+app.post("/ask", askLimiter, async (req, res) => {
   const { question } = req.body;
   try {
     const response = await axios.post("http://localhost:5000/ask", {
@@ -49,7 +75,7 @@ app.post("/ask", async (req, res) => {
   }
 });
 
-app.post("/summarize", async (req, res) => {
+app.post("/summarize", summarizeLimiter, async (req, res) => {
   try {
     const response = await axios.post("http://localhost:5000/summarize", req.body || {});
     res.json({ summary: response.data.summary });

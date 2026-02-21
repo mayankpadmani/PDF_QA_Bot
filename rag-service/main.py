@@ -9,10 +9,14 @@ import os
 import uvicorn
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 
 load_dotenv()
 
 app = FastAPI()
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
 # Temporary global variables
 vectorstore = None
@@ -83,6 +87,7 @@ class SummarizeRequest(BaseModel):
     pdf: str | None = None
 
 @app.post("/process-pdf")
+@limiter.limit("15/15 minutes")
 def process_pdf(data: PDFPath):
     global vectorstore, qa_chain
 
@@ -101,6 +106,7 @@ def process_pdf(data: PDFPath):
 
 
 @app.post("/ask")
+@limiter.limit("60/15 minutes")
 def ask_question(data: Question):
     global vectorstore, qa_chain
     if not qa_chain:
@@ -125,6 +131,7 @@ def ask_question(data: Question):
 
 
 @app.post("/summarize")
+@limiter.limit("15/15 minutes")
 def summarize_pdf(_: SummarizeRequest):
     global vectorstore, qa_chain
     if not qa_chain:
