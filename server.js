@@ -3,14 +3,23 @@ const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const path = require("path");
+const {
+  globalLimiter,
+  uploadLimiter,
+  askLimiter,
+  summarizeLimiter,
+  compareLimiter,
+} = require('./middleware/rateLimiter');
 
 const app = express();
+app.set('trust proxy', 1);
+app.use(globalLimiter);
 app.use(cors());
 app.use(express.json());
 
 const upload = multer({ dest: "uploads/" });
 
-app.post("/upload", upload.single("file"), async (req, res) => {
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     const filePath = path.join(__dirname, req.file.path);
     const response = await axios.post("http://localhost:5000/process-pdf", {
@@ -23,17 +32,17 @@ app.post("/upload", upload.single("file"), async (req, res) => {
   }
 });
 
-app.post("/ask", async (req, res) => {
+app.post("/ask", askLimiter, async (req, res) => {
   const response = await axios.post("http://localhost:5000/ask", req.body);
   res.json(response.data);
 });
 
-app.post("/summarize", async (req, res) => {
+app.post("/summarize", summarizeLimiter, async (req, res) => {
   const response = await axios.post("http://localhost:5000/summarize", req.body);
   res.json(response.data);
 });
 
-app.post("/compare", async (req, res) => {
+app.post("/compare", compareLimiter, async (req, res) => {
   try {
     const response = await axios.post("http://localhost:5000/compare", req.body);
     res.json({ comparison: response.data.comparison });
