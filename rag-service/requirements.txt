@@ -11,3 +11,6 @@ faiss-cpu
 pypdf
 requests
 numpy
+pytesseract
+pdf2image
+Pillow
