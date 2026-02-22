@@ -11,4 +11,6 @@ faiss-cpu
 pypdf
 requests
 numpy
-slowapi
+pytesseract
+pdf2image
+Pillow

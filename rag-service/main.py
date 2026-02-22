@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
+from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -8,6 +9,8 @@ from dotenv import load_dotenv
 import os
 import uvicorn
 import torch
+import pytesseract
+from pdf2image import convert_from_path
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from uuid import uuid4
 import numpy as np
@@ -119,10 +122,23 @@ def process_pdf(data: PDFPath):
     loader = PyPDFLoader(data.filePath)
     docs = loader.load()
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100
-    )
+    # Checking to be done if there is enough text extracted
+    total_text_length = sum(len(doc.page_content.strip()) for doc in docs)
+    
+    # If minimal text found, use OCR fallback
+    if total_text_length < 50:
+        print("Detected scanned PDF. Switching to OCR fallback...")
+        try:
+            images = convert_from_path(data.filePath)
+            ocr_docs = []
+            for i, image in enumerate(images):
+                text = pytesseract.image_to_string(image)
+                ocr_docs.append(Document(page_content=text, metadata={"page": i}))
+            docs = ocr_docs
+        except Exception as e:
+            return {"error": f"OCR extraction failed: {str(e)}"}
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
 
     if not chunks:
