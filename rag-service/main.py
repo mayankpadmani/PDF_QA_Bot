@@ -14,6 +14,7 @@ import os
 import re
 import uvicorn
 import time
+from pathlib import Path
 
 # -------------------------------------------------------------------
 # APP SETUP
@@ -152,6 +153,10 @@ class SummarizeRequest(BaseModel):
     pdf: str | None = None
 
 
+
+class CompareRequest(BaseModel):
+    session_id: str
+
 # -------------------------------------------------------------------
 # SESSION CLEANUP
 # -------------------------------------------------------------------
@@ -278,11 +283,25 @@ def ask_question(request: Request, data: AskRequest):
         content = msg.get("content", "")
         conversation_context += f"{role}: {content}\n"
 
-    docs = vectorstore.similarity_search(question, k=4)
-    if not docs:
-        return {"answer": "No relevant context found in the uploaded document."}
+    docs_with_scores = vectorstore.similarity_search_with_score(question, k=4)
+    if not docs_with_scores:
+        return {"answer": "No relevant context found in the uploaded document.", "confidence_score": 0}
 
-    context = "\n\n".join([doc.page_content for doc in docs])
+    # Convert FAISS scores to cosine similarities
+    scored = [(doc, score, faiss_score_to_cosine_sim(score)) for doc, score in docs_with_scores]
+    similarities = [sim for _, _, sim in scored]
+    confidence = compute_confidence([score for _, score, _ in scored])
+
+    # Relevance threshold check
+    top3_avg_sim = sum(sorted(similarities, reverse=True)[:3]) / 3 if similarities else 0
+    if top3_avg_sim < RELEVANCE_THRESHOLD:
+        return {
+            "answer": "I cannot answer this question based on the uploaded document. It appears unrelated.",
+            "confidence_score": confidence
+        }
+
+    relevant_docs = [doc for doc, _, sim in scored if sim >= RELEVANCE_THRESHOLD]
+    context = "\n\n".join([d.page_content for d in relevant_docs])
 
     question_with_history = question
     if conversation_context.strip():
@@ -308,22 +327,18 @@ def ask_question(request: Request, data: AskRequest):
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
+async def summarize_pdf(request: Request, data: SummarizeRequest):
     cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
-    session = sessions.get(data.session_id)
-    if not session:
-        return {"summary": "Session expired or PDF not uploaded"}
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
 
-    session["last_accessed"] = time.time()
-    vectorstore = session["vectorstore"]
-
-
-    docs = vectorstore.similarity_search("Summarize the document.", k=6)
-    if not docs:
-        return {"summary": "No content available"}
-
-    context = "\n\n".join([doc.page_content for doc in docs])
+    # Extract all text from the vectorstore for summarization
+    all_docs = list(vectorstore.docstore._dict.values())
+    full_text = "\n".join([doc.page_content for doc in all_docs])
 
     system_prompt = (
         "You are a document summarization assistant.\n"
@@ -335,7 +350,7 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
         "4. Use ONLY the information in the provided context."
     )
 
-    user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
+    user_prompt = f"Content:\n{full_text[:4000]}\n\nSummary (bullet points):"
 
     raw_summary = generate_response(
         system_prompt=system_prompt,
@@ -345,6 +360,75 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     summary = normalize_answer(raw_summary)
     return {"summary": summary}
 
+
+@app.post("/compare")
+@limiter.limit("15/15 minutes")
+async def compare_documents(request: Request, data: CompareRequest):
+    """
+    Compare multiple documents within a session.
+    Groups chunks by their source metadata and generates a comparative summary.
+    """
+    cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
+
+    # Extract all documents from the FAISS internal docstore
+    try:
+        all_docs = list(vectorstore.docstore._dict.values())
+    except Exception:
+        all_docs = []
+
+    if not all_docs:
+        return {"comparison": "No documents found to compare."}
+
+    # Group chunks by their source file
+    docs_by_source = {}
+    for doc in all_docs:
+        source = doc.metadata.get("source", "Unknown")
+        if source not in docs_by_source:
+            docs_by_source[source] = []
+        docs_by_source[source].append(doc.page_content)
+
+    sources = list(docs_by_source.keys())
+    if len(sources) < 2:
+        return {"comparison": "Please upload at least two documents to generate a comparison."}
+
+    # Prepare context for comparison
+    comparison_context = ""
+    for i, source in enumerate(sources):
+        filename = Path(source).name
+        content_sample = "\n".join(docs_by_source[source])[:1500]
+        comparison_context += f"--- Document {i+1}: {filename} ---\n{content_sample}\n\n"
+
+    system_prompt = "You are a professional analyst comparing multiple documents."
+    user_prompt = f"""
+    Please compare the following documents:
+
+    {comparison_context}
+
+    Instructions:
+    - Identify key similarities and differences.
+    - Format as a structured comparison (bullet points/sections).
+    - Be objective and concise.
+    """
+
+    comparison_result = generate_response(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=800
+    )
+    return {"comparison": comparison_result}
+
+
+# -------------------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
 
 # -------------------------------------------------------------------
 # START SERVER
