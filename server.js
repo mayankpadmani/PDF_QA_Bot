@@ -76,12 +76,13 @@ axiosRetry(axios, {
 });
 
 // ------------------------------------------------------------------
-// RATE LIMITERS (MASTER FEATURE)
+// RATE LIMITERS
 // ------------------------------------------------------------------
 const uploadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message: "Too many PDF uploads, try again later",
+  message:
+    "Too many document uploads from this IP, please try again after 15 minutes",
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -111,8 +112,37 @@ const compareLimiter = rateLimit({
 });
 
 // ------------------------------------------------------------------
-// MULTER CONFIG
+// MULTER CONFIG (multi-format document storage)
 // ------------------------------------------------------------------
+
+
+
+const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
+
+const storage = multer.diskStorage({
+  destination: "uploads/",
+  filename: (req, file, cb) => {
+    // Sanitize and preserve original extension so the Python service can detect format
+    const safeName = path.basename(file.originalname);
+    const ext = path.extname(safeName).toLowerCase();
+    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    cb(null, uniqueName);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const safeName = path.basename(file.originalname);
+    const ext = path.extname(safeName).toLowerCase();
+    if (SUPPORTED_EXTENSIONS.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Unsupported file type. Allowed: ${SUPPORTED_EXTENSIONS.join(", ")}`));
+    }
+  }
+});
 
 
 // ------------------------------------------------------------------
@@ -126,20 +156,22 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       });
     }
 
-    const sessionId = req.body.sessionId;
+    const { sessionId } = req.body;
     if (!sessionId) {
       return res.status(400).json({ error: "Missing sessionId." });
     }
 
     const filePath = path.join(__dirname, req.file.path);
 
-    const response = await axios.post(
+    await axios.post(
       "http://localhost:5000/process-pdf",
       { filePath, session_id: sessionId },
       { timeout: API_REQUEST_TIMEOUT }
     );
 
-    res.json({ message: "PDF uploaded & processed successfully" });
+    // Generate a unique doc_id (Python backend doesn't return one)
+    const doc_id = `doc_${Date.now()}_${Math.round(Math.random() * 1e6)}`;
+    res.json({ doc_id });
   } catch (err) {
     console.error("Upload failed:", err.response?.data || err.message);
 
@@ -159,7 +191,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 app.post("/ask", askLimiter, async (req, res) => {
   const { question, sessionId } = req.body;
 
-  // ---- Input validation (PR FEATURE) ----
+  // ---- Input validation ----
   if (!sessionId) {
     return res.status(400).json({ error: "Missing sessionId." });
   }

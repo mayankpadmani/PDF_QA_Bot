@@ -1,18 +1,18 @@
 # PDF Q&A Bot
 
-RAG-based PDF question-answering app with:
+RAG-based document question-answering app with:
 
 - **Frontend**: React app (`frontend/`)
 - **Backend API**: Node + Express (`server.js`)
 - **RAG Service**: FastAPI + Hugging Face + FAISS (`rag-service/`)
 
-Upload a PDF, ask questions from its content, and generate a short summary.
+Upload documents (PDF, DOCX, TXT, Markdown), ask questions from their content, and generate summaries.
 
 ## Architecture
 
 1. Frontend uploads file to Node backend (`/upload`)
 2. Node forwards file path to FastAPI (`/process-pdf`)
-3. FastAPI loads/splits PDF, builds vector index with embeddings
+3. FastAPI detects file format (`.pdf`, `.docx`, `.txt`, `.md`), loads and splits the document, builds vector index with embeddings
 4. For `/ask` and `/summarize`, FastAPI retrieves relevant chunks and generates output with a Hugging Face model
 
 ## Project Structure
@@ -87,7 +87,7 @@ Open: `http://localhost:3000`
 
 Node backend (`http://localhost:4000`):
 
-- `POST /upload` (multipart form-data, field: `file`)
+- `POST /upload` (multipart form-data, field: `file`) — accepts `.pdf`, `.docx`, `.txt`, `.md`
 - `POST /ask` (`{ "question": "..." }`)
 - `POST /summarize` (`{}`)
 
