@@ -1,16 +1,20 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
+from fastapi import Request
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 from dotenv import load_dotenv
 import os
+import re
 import uvicorn
 import torch
 import pytesseract
 from pdf2image import convert_from_path
+import time
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -21,9 +25,10 @@ app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
-# Temporary global variables
-vectorstore = None
-qa_chain = False
+# Session Management (fix-data-leakage: per-session vectorstores)
+sessions = {}  # Format: { "session_id": { "vectorstore": FAISS, "last_accessed": float } }
+SESSION_TIMEOUT = 3600  # 1 hour
+
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
 generation_tokenizer = None
 generation_model = None
@@ -32,6 +37,51 @@ generation_is_encoder_decoder = False
 # Load local embedding model
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+
+# ---------------------------------------------------------------------------
+# TEXT NORMALIZATION UTILITIES
+# ---------------------------------------------------------------------------
+
+def normalize_spaced_text(text: str) -> str:
+    """
+    Fixes character-level spaced text produced by PyPDFLoader on certain
+    vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
+
+    Examples:
+        'J A I N I   S O L A N K I'  ->  'JAINI SOLANKI'
+        'I B M'                       ->  'IBM'
+        'N P T E L'                   ->  'NPTEL'
+
+    Normal multi-letter words are left completely untouched.
+    """
+    def fix_spaced_word(match):
+        return match.group(0).replace(" ", "")
+
+    # Pattern: 3+ single alpha chars each separated by exactly one space
+    pattern = r'\b(?:[A-Za-z] ){2,}[A-Za-z]\b'
+    return re.sub(pattern, fix_spaced_word, text)
+
+
+def normalize_answer(text: str) -> str:
+    """
+    Post-processes the LLM-generated answer:
+    - Removes any residual character-level spacing.
+    - Strips prompt leakage (lines starting with 'Answer', 'Context', etc.)
+    - Collapses excessive whitespace.
+    """
+    # Remove residual character spacing in the answer itself
+    text = normalize_spaced_text(text)
+    # Strip any prompt-leakage prefixes the model might echo
+    text = re.sub(r'^(Answer[^:]*:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
+    # Collapse multiple spaces/newlines
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# MODEL LOADING & GENERATION
+# ---------------------------------------------------------------------------
 
 def load_generation_model():
     global generation_tokenizer, generation_model, generation_is_encoder_decoder
@@ -43,9 +93,15 @@ def load_generation_model():
     generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
     if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+        generation_model = AutoModelForSeq2SeqLM.from_pretrained(
+            HF_GENERATION_MODEL,
+            low_cpu_mem_usage=False
+        )
     else:
-        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+        generation_model = AutoModelForCausalLM.from_pretrained(
+            HF_GENERATION_MODEL,
+            low_cpu_mem_usage=False
+        )
 
     if torch.cuda.is_available():
         generation_model = generation_model.to("cuda")
@@ -79,23 +135,48 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
     text = tokenizer.decode(new_tokens, skip_special_tokens=True)
     return text.strip()
 
+
+# ---------------------------------------------------------------------------
+# REQUEST MODELS
+# ---------------------------------------------------------------------------
+
 class PDFPath(BaseModel):
     filePath: str
+    session_id: str
 
-class Question(BaseModel):
+class AskRequest(BaseModel):
     question: str
+    session_id: str
+    history: list = []
 
 
 class SummarizeRequest(BaseModel):
     pdf: str | None = None
+    session_id: str
+
+def cleanup_expired_sessions():
+    current_time = time.time()
+    expired = [sid for sid, data in sessions.items() if current_time - data["last_accessed"] > SESSION_TIMEOUT]
+    for sid in expired:
+        del sessions[sid]
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINTS
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: PDFPath):
-    global vectorstore, qa_chain
+    cleanup_expired_sessions()
 
     loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
+    raw_docs = loader.load()
 
     # Checking to be done if there is enough text extracted
     total_text_length = sum(len(doc.page_content.strip()) for doc in docs)
@@ -115,59 +196,113 @@ def process_pdf(request: Request, data: PDFPath):
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
-    if not chunks:
-            return {"error": "No text chunks generated from the PDF. Please check your file."}
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+    # ── Layer 1: normalize at ingestion ──────────────────────────────────────
+    cleaned_docs = []
+    for doc in raw_docs:
+        cleaned_content = normalize_spaced_text(doc.page_content)
+        cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
 
-    qa_chain = True  # Just a flag to indicate PDF is processed
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
+    chunks = splitter.split_documents(cleaned_docs)
+    if not chunks:
+        return {"error": "No text chunks generated from the PDF. Please check your file."}
+
+    sessions[data.session_id] = {
+        "vectorstore": FAISS.from_documents(chunks, embedding_model),
+        "last_accessed": time.time()
+    }
 
     return {"message": "PDF processed successfully"}
 
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: Question):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"answer": "Please upload a PDF first!"}
+def ask_question(request: Request, data: AskRequest):
+    cleanup_expired_sessions()
 
-    docs = vectorstore.similarity_search(data.question, k=4)
+    session_data = sessions.get(data.session_id)
+    if not session_data:
+        return {"answer": "Session expired or no PDF uploaded for this session!"}
+
+    session_data["last_accessed"] = time.time()
+    vectorstore = session_data["vectorstore"]
+
+    question = data.question
+    history = data.history
+    conversation_context = ""
+    # Use only last 5 messages to avoid long prompts
+    for msg in history[-5:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        conversation_context += f"{role}: {content}\n"
+
+    docs = vectorstore.similarity_search(question, k=4)
     if not docs:
         return {"answer": "No relevant context found."}
 
+    # ── Layer 2a: context is already clean (normalized at ingestion) ──────────
     context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = (
-        "You are a helpful assistant for question answering over PDF documents. "
-        "Use only the provided context. If the context does not contain the answer, say so briefly.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\n"
-        "Answer:"
-    )
+    prompt = f"""
+    You are a helpful assistant answering questions from a PDF document.
 
-    answer = generate_response(prompt, max_new_tokens=256)
+    Conversation History:
+    {conversation_context}
+
+    Document Context:
+    {context}
+
+    Current Question:
+    {question}
+
+    Instructions:
+    - Use the document context to answer.
+    - If the answer is not in the document, say so briefly.
+    - Keep the answer concise.
+
+    Answer:
+    """
+
+    raw_answer = generate_response(prompt, max_new_tokens=128)
+
+    # ── Layer 3: post-process the answer itself ───────────────────────────────
+    answer = normalize_answer(raw_answer)
     return {"answer": answer}
 
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, _: SummarizeRequest):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"summary": "Please upload a PDF first!"}
+def summarize_pdf(request: Request, data: SummarizeRequest):
+    cleanup_expired_sessions()
+
+    session_data = sessions.get(data.session_id)
+    if not session_data:
+        return {"summary": "Session expired or no PDF uploaded for this session!"}
+
+    session_data["last_accessed"] = time.time()
+    vectorstore = session_data["vectorstore"]
 
     docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
     if not docs:
         return {"summary": "No document context available to summarize."}
 
+    # Context is already clean (normalized at ingestion)
     context = "\n\n".join([doc.page_content for doc in docs])
+
     prompt = (
-        "Summarize the following document content in 6-8 concise bullet points.\n\n"
+        "You are a document summarization assistant working with a certificate or official document.\n"
+        "RULES:\n"
+        "1. Summarize in 6-8 concise bullet points.\n"
+        "2. Clearly distinguish: who received the certificate, what course, which company issued it,\n"
+        "   who signed it, on what platform, and on what date.\n"
+        "3. Return clean, properly formatted text — no character spacing, proper Title Case for names.\n"
+        "4. Use ONLY the information in the context below.\n\n"
         f"Context:\n{context}\n\n"
-        "Summary:"
+        "Summary (bullet points):"
     )
 
-    summary = generate_response(prompt, max_new_tokens=220)
+    raw_summary = generate_response(prompt, max_new_tokens=256)
+    summary = normalize_answer(raw_summary)
     return {"summary": summary}
 
 
