@@ -4,9 +4,10 @@ python-dotenv
 pydantic
 langchain
 langchain-community
+langchain-core
 langchain-text-splitters
+langchain-core
 sentence-transformers
-transformers
 faiss-cpu
 pypdf
 python-docx
@@ -15,3 +16,5 @@ numpy
 pytesseract
 pdf2image
 Pillow
+slowapi
+groq

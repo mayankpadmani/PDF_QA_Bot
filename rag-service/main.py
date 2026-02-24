@@ -6,7 +6,11 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from groq import Groq
 from dotenv import load_dotenv
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 import os
 import re
 import uvicorn
@@ -14,18 +18,6 @@ import torch
 import pytesseract
 from pdf2image import convert_from_path
 import time
-import threading
-import logging
-from transformers import (
-    AutoConfig,
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    AutoModelForCausalLM,
-)
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from pathlib import Path
-import docx
 
 # -------------------------------------------------------------------
 # APP SETUP
@@ -39,24 +31,24 @@ app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# ---------------------------------------------------------------------------
+# GROQ CLIENT SETUP
+# ---------------------------------------------------------------------------
 
-# -------------------------------------------------------------------
-# CONFIG
-# -------------------------------------------------------------------
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
-LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Please add it to your .env file.\n"
+        "Get a free key at https://console.groq.com"
+    )
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Session management
+sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
-sessions = {}  # { session_id: { vectorstore, last_accessed } }
-
-# -------------------------------------------------------------------
-# MODELS
-# -------------------------------------------------------------------
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
 
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
@@ -66,203 +58,84 @@ embedding_model = HuggingFaceEmbeddings(
 # TEXT NORMALIZATION
 # -------------------------------------------------------------------
 def normalize_spaced_text(text: str) -> str:
-    def fix(match):
+    """
+    Fixes character-level spaced text produced by PyPDFLoader on certain
+    vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
+    """
+    def fix_spaced_word(match):
         return match.group(0).replace(" ", "")
     pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
     return re.sub(pattern, fix, text)
 
 
 def normalize_answer(text: str) -> str:
+    """
+    Post-processes the LLM-generated answer.
+    """
     text = normalize_spaced_text(text)
-    text = re.sub(
-        r"^(Answer[^:]*:|Context:|Question:)\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Strip only clear prompt-echo artefacts at the very start
+    text = re.sub(r'^(Final Answer:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
 
-SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"]
+# ---------------------------------------------------------------------------
+# CCC PROMPT TEMPLATE (Connect – Content – Continue)
+# ---------------------------------------------------------------------------
+
+_CCC_SYSTEM = (
+    "You are an intelligent PDF Question Answering Assistant.\n"
+    "Your task is to answer the user's question strictly using the provided context "
+    "retrieved from uploaded documents.\n\n"
+    "Follow the CCC communication structure in a SINGLE response:\n\n"
+    "1. Context Connection — Start with a short professional greeting (e.g. \"Hello,\").\n"
+    "2. Content Explanation — Rewrite the retrieved context in clear, meaningful, "
+    "grammatically correct sentences. Do NOT copy text directly.\n"
+    "3. Core Answer — Present the main explanation in a structured, readable format.\n"
+    "4. Call to Action — End with a relevant follow-up question to encourage further exploration.\n\n"
+    "Rules:\n"
+    "- Use ONLY the provided context. Do NOT add external knowledge.\n"
+    "- If the answer is not in the context, say: "
+    "\"The uploaded document does not contain sufficient information to answer this question.\"\n"
+    "- Maintain a clear, professional tone.\n"
+    "- Produce one continuous response — no bullet headers like '1.' or '2.'."
+)
+
+_CCC_USER_TEMPLATE = """\
+Context from the uploaded PDF:
+{context}
+
+Question:
+{question}
+
+Final Answer:"""
+
+CCC_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=_CCC_USER_TEMPLATE,
+)
 
 
-# ===============================
-# DOCUMENT LOADERS
-# ===============================
-def load_pdf(file_path: str) -> list[Document]:
-    """Load a PDF file using PyPDFLoader."""
-    loader = PyPDFLoader(file_path)
-    return loader.load()
+# ---------------------------------------------------------------------------
+# GROQ GENERATION
+# ---------------------------------------------------------------------------
 
-
-def _extract_full_text_from_docx(doc) -> str:
-    """Extract text from paragraphs, tables, headers, and footers in a DOCX file."""
-    texts: list[str] = []
-
-    def add_paragraphs(paragraphs):
-        for para in paragraphs:
-            text = para.text.strip()
-            if text:
-                texts.append(text)
-
-    def add_table(table):
-        for row in table.rows:
-            for cell in row.cells:
-                add_paragraphs(cell.paragraphs)
-                for inner_table in cell.tables:
-                    add_table(inner_table)
-
-    # Body paragraphs and tables
-    add_paragraphs(doc.paragraphs)
-    for table in doc.tables:
-        add_table(table)
-
-    # Headers and footers
-    for section in doc.sections:
-        header = section.header
-        footer = section.footer
-        if header is not None:
-            add_paragraphs(header.paragraphs)
-            for table in header.tables:
-                add_table(table)
-        if footer is not None:
-            add_paragraphs(footer.paragraphs)
-            for table in footer.tables:
-                add_table(table)
-
-    return "\n".join(texts)
-
-
-def load_docx(file_path: str) -> list[Document]:
-    """Load a DOCX file using python-docx (extracts paragraphs, tables, headers, footers)."""
-    doc = docx.Document(file_path)
-    full_text = _extract_full_text_from_docx(doc)
-    if not full_text.strip():
-        return []
-    return [Document(page_content=full_text, metadata={"source": file_path})]
-
-
-def load_txt(file_path: str) -> list[Document]:
-    """Load a plain text file."""
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-    if not content.strip():
-        return []
-    return [Document(page_content=content, metadata={"source": file_path})]
-
-
-def load_md(file_path: str) -> list[Document]:
-    """Load a Markdown file (treated as plain text for RAG)."""
-    return load_txt(file_path)
-
-
-def load_document(file_path: str) -> list[Document]:
-    """Route to the appropriate loader based on file extension."""
-    ext = Path(file_path).suffix.lower()
-    if ext == ".pdf":
-        return load_pdf(file_path)
-    elif ext == ".docx":
-        return load_docx(file_path)
-    elif ext in (".txt", ".md"):
-        return load_txt(file_path)
-    else:
-        raise ValueError(f"Unsupported file format: {ext}. Supported: {SUPPORTED_EXTENSIONS}")
-
-
-# -------------------------------------------------------------------
-# MODEL LOADING
-# -------------------------------------------------------------------
-def load_generation_model():
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-    if generation_model and generation_tokenizer:
-        return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(config.is_encoder_decoder)
-
-    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
-
-    if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-    else:
-        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
-
-    if torch.cuda.is_available():
-        generation_model = generation_model.to("cuda")
-
-    generation_model.eval()
-    return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-# -------------------------------------------------------------------
-# SAFE GENERATION WITH TIMEOUT
-# -------------------------------------------------------------------
-class TimeoutException(Exception):
-    pass
-
-
-def generate_with_timeout(model, encoded, max_new_tokens, pad_token_id, timeout):
-    result = {"output": None, "error": None}
-
-    def run():
-        try:
-            with torch.no_grad():
-                result["output"] = model.generate(
-                    **encoded,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=pad_token_id,
-                )
-        except Exception as e:
-            result["error"] = str(e)
-
-    thread = threading.Thread(target=run, daemon=True)
-    thread.start()
-    thread.join(timeout)
-
-    if thread.is_alive():
-        raise TimeoutException("LLM generation timed out")
-
-    if result["error"]:
-        raise Exception(result["error"])
-
-    return result["output"]
-
-
-def generate_response(prompt: str, max_new_tokens: int) -> str:
-    tokenizer, model, is_encoder_decoder = load_generation_model()
-    device = next(model.parameters()).device
-
-    encoded = tokenizer(
-        prompt,
-        return_tensors="pt",
-        truncation=True,
-        max_length=2048,
+def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
+    """
+    Calls the Groq chat-completions API with a system + user message pair.
+    """
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,
     )
-    encoded = {k: v.to(device) for k, v in encoded.items()}
+    return completion.choices[0].message.content.strip()
 
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-
-    try:
-        output_ids = generate_with_timeout(
-            model,
-            encoded,
-            max_new_tokens,
-            pad_token_id,
-            LLM_GENERATION_TIMEOUT,
-        )
-    except TimeoutException:
-        raise HTTPException(status_code=504, detail="Model timed out")
-
-    if is_encoder_decoder:
-        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-
-    input_len = encoded["input_ids"].shape[1]
-    return tokenizer.decode(
-        output_ids[0][input_len:], skip_special_tokens=True
-    ).strip()
 
 # -------------------------------------------------------------------
 # REQUEST MODELS
@@ -278,15 +151,10 @@ class AskRequest(BaseModel):
     session_id: str
     history: list = []
 
-    @validator("question")
-    def validate_question(cls, v):
-        if not v.strip():
-            raise ValueError("Question cannot be empty")
-        return v.strip()
-
-
 class SummarizeRequest(BaseModel):
     session_id: str
+    pdf: str | None = None
+
 
 # -------------------------------------------------------------------
 # SESSION CLEANUP
@@ -302,7 +170,8 @@ def cleanup_expired_sessions():
 
 # -------------------------------------------------------------------
 # ENDPOINTS
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: DocumentPath):
@@ -425,64 +294,37 @@ def ask_question(request: Request, data: AskRequest):
 
     question = data.question
     history = data.history
+
     conversation_context = ""
-    # Use only last 5 messages to avoid long prompts
     for msg in history[-5:]:
         role = msg.get("role", "")
         content = msg.get("content", "")
         conversation_context += f"{role}: {content}\n"
 
-    # Use similarity_search_with_score to get FAISS L2 squared distances
-    docs_with_scores = vectorstore.similarity_search_with_score(question, k=4)
-    if not docs_with_scores:
-        return {"answer": "No relevant context found.", "confidence_score": 0}
+    docs = vectorstore.similarity_search(question, k=4)
+    if not docs:
+        return {"answer": "No relevant context found in the uploaded document."}
 
-    # Convert FAISS scores to cosine similarities once (avoid redundant computation)
-    scored = [(doc, score, faiss_score_to_cosine_sim(score)) for doc, score in docs_with_scores]
-    similarities = [sim for _, _, sim in scored]
-    top3_sims = sorted(similarities, reverse=True)[:3]
-    top3_avg_sim = sum(top3_sims) / len(top3_sims)
-    confidence = round(float(top3_avg_sim * 100), 1)
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    # Reject if top-3 average cosine similarity is below threshold
-    if top3_avg_sim < RELEVANCE_THRESHOLD:
-        return {
-            "answer": "I cannot answer this question based on the uploaded document. "
-                      "The question appears to be unrelated to the document content.",
-            "confidence_score": confidence
-        }
+    question_with_history = question
+    if conversation_context.strip():
+        question_with_history = (
+            f"Conversation so far:\n{conversation_context.strip()}\n\n"
+            f"Current Question: {question}"
+        )
 
-    # Filter to only keep chunks above relevance threshold
-    relevant_docs = [doc for doc, _, sim in scored if sim >= RELEVANCE_THRESHOLD]
-    # At least one doc must pass since top3_avg_sim >= RELEVANCE_THRESHOLD
-    assert relevant_docs, "Invariant violated: relevant_docs should not be empty"
+    user_prompt = CCC_PROMPT.format(
+        context=context,
+        question=question_with_history,
+    )
 
-    # Context is already clean (normalized at ingestion)
-    context = "\n\n".join([d.page_content for d in relevant_docs])
+    raw_answer = generate_response(
+        system_prompt=_CCC_SYSTEM,
+        user_prompt=user_prompt,
+        max_tokens=600,
+    )
 
-    prompt = f"""
-    You are a helpful assistant answering ONLY from the document context below.
-
-    Conversation History:
-    {conversation_context}
-
-    Document Context:
-    {context}
-
-    Current Question:
-    {question}
-
-    Instructions:
-    - Use the document context to answer.
-    - If the answer is not in the document, say so briefly.
-    - Keep the answer concise.
-
-    Answer:
-    """
-
-    raw_answer = generate_response(prompt, max_new_tokens=128)
-
-    # ── Layer 3: post-process the answer itself ───────────────────────────────
     answer = normalize_answer(raw_answer)
     return {"answer": answer, "confidence_score": confidence}
 
@@ -504,15 +346,28 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     if not docs:
         return {"summary": "No content available"}
 
-    context = "\n\n".join(doc.page_content for doc in docs)
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    prompt = (
-        "Summarize the document in 6-8 concise bullet points.\n"
-        f"Context:\n{context}\nSummary:"
+    system_prompt = (
+        "You are a document summarization assistant.\n"
+        "Rules:\n"
+        "1. Summarize in 6-8 concise bullet points.\n"
+        "2. Clearly state: who received the certificate/document, what it is for, "
+        "which organization issued it, who authorized it, and the date.\n"
+        "3. Use proper Title Case for names. Return clean, readable text.\n"
+        "4. Use ONLY the information in the provided context."
     )
 
-    summary = generate_response(prompt, max_new_tokens=220)
-    return {"summary": normalize_answer(summary)}
+    user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
+
+    raw_summary = generate_response(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=512
+    )
+    summary = normalize_answer(raw_summary)
+    return {"summary": summary}
+
 
 # -------------------------------------------------------------------
 # START SERVER

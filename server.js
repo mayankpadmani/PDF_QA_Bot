@@ -208,18 +208,13 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       { timeout: API_REQUEST_TIMEOUT }
     );
 
-    // Generate a unique doc_id (Python backend doesn't return one)
-    const doc_id = `doc_${Date.now()}_${Math.round(Math.random() * 1e6)}`;
-    res.json({ doc_id });
+    // Use filename as a fallback doc_id if one isn't returned
+    res.json({
+      message: response.data.message,
+      doc_id: response.data.doc_id || req.file.filename
+    });
   } catch (err) {
-    console.error("Upload failed:", err.response?.data || err.message);
-
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({
-        error: "PDF processing timed out",
-      });
-    }
-
+    console.error("Upload failed:", err.message);
     res.status(500).json({ error: "Upload failed" });
   }
 });
@@ -268,15 +263,10 @@ app.post("/ask", askLimiter, async (req, res) => {
       content: response.data.answer,
     });
 
-    res.json({ answer: response.data.answer });
-  } catch (err) {
-    console.error("Ask failed:", err.response?.data || err.message);
-
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({ error: "Question timed out" });
-    }
-
-    res.status(500).json({ error: "Error answering question" });
+    res.json(response.data);
+  } catch (error) {
+    console.error("Ask failed:", error.message);
+    res.status(500).json({ error: "Error asking question" });
   }
 });
 
@@ -310,11 +300,6 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
     res.json({ summary: response.data.summary });
   } catch (err) {
     console.error("Summarize failed:", err.response?.data || err.message);
-
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({ error: "Summarization timed out" });
-    }
-
     res.status(500).json({ error: "Error summarizing PDF" });
   }
 });
@@ -323,6 +308,11 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
 // ROUTE: COMPARE
 // ------------------------------------------------------------------
 app.post("/compare", compareLimiter, async (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing sessionId." });
+  }
+
   try {
     const response = await axios.post(
       "http://localhost:5000/compare",
@@ -334,16 +324,6 @@ app.post("/compare", compareLimiter, async (req, res) => {
     console.error("Compare failed:", err.response?.data || err.message);
     res.status(500).json({ error: "Error comparing documents" });
   }
-});
-
-// Global error handler for multer file size limit
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(400).json({ error: "File exceeds 20MB limit." });
-    }
-  }
-  next(err);
 });
 
 app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
