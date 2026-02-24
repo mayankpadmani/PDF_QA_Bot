@@ -32,6 +32,11 @@ venv/
 
 .env
 
+<<<<<<< fix/security-upload-validation
+# Ignore the uploads directory where PDFs are stored temporarily
+/uploads/
+=======
 # Uploaded PDFs
 uploads/*
 !uploads/.gitkeep
+>>>>>>> master
