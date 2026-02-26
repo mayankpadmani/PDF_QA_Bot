@@ -3,15 +3,17 @@ const cors = require("cors");
 const multer = require("multer");
 const axios = require("axios");
 const axiosRetry = require("axios-retry").default;
-const path = require("path");
-const rateLimit = require("express-rate-limit");
-const crypto = require("crypto");
-const { fileTypeFromFile } = require("file-type");
 const fs = require("fs");
+const path = require("path");
+const crypto = require("crypto");
+const rateLimit = require("express-rate-limit");
+const { fileTypeFromFile } = require("file-type");
 
 const app = express(); // Trust first proxy for rate limiting if behind a proxy
 const session = require("express-session");
 require("dotenv").config();
+
+const app = express();
 
 // ------------------------------------------------------------------
 // CONFIGURATION
@@ -43,13 +45,13 @@ app.use(
     saveUninitialized: true,
     cookie: {
       secure: false,
-      maxAge: 1000 * 60 * 60 * 24, // 24 hours
+      maxAge: 1000 * 60 * 60 * 24,
     },
   })
 );
 
 // ------------------------------------------------------------------
-// AXIOS RETRY CONFIG (PR FEATURE)
+// AXIOS RETRY CONFIG
 // ------------------------------------------------------------------
 axiosRetry(axios, {
   retries: MAX_RETRY_ATTEMPTS,
@@ -58,11 +60,6 @@ axiosRetry(axios, {
     axiosRetry.isNetworkOrIdempotentRequestError(error) ||
     error.code === "ECONNABORTED" ||
     (error.response && error.response.status >= 500),
-  onRetry: (retryCount, error, requestConfig) => {
-    console.warn(
-      `Retry ${retryCount} for ${requestConfig.url} - ${error.message}`
-    );
-  },
 });
 
 // ------------------------------------------------------------------
@@ -71,37 +68,26 @@ axiosRetry(axios, {
 const uploadLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 5,
-  message:
-    "Too many document uploads from this IP, please try again after 15 minutes",
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
 const askLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 30,
-  message: "Too many questions, try again later",
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
 const summarizeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
-  message: "Too many summarize requests, try again later",
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
 const compareLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
-  message: "Too many compare requests, try again later",
-  standardHeaders: true,
-  legacyHeaders: false,
 });
 
-// Storage for uploaded PDFs
+// ------------------------------------------------------------------
+// FILE STORAGE
+// ------------------------------------------------------------------
 const UPLOAD_DIR = path.resolve(__dirname, "uploads");
 
 if (!fs.existsSync(UPLOAD_DIR)) {
@@ -109,19 +95,22 @@ if (!fs.existsSync(UPLOAD_DIR)) {
 }
 
 // ------------------------------------------------------------------
-// MULTER CONFIG (multi-format document storage)
+// MULTER CONFIG
 // ------------------------------------------------------------------
+
 const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
+const PDF_MIME_TYPE = "application/pdf";
+const PDF_MAGIC = "%PDF"
 
 const storage = multer.diskStorage({
   destination: "uploads/",
   filename: (req, file, cb) => {
-    // Sanitize and preserve original extension so the Python service can detect format
-    const safeName = path.basename(file.originalname);
-    const ext = path.extname(safeName).toLowerCase();
-    const uniqueName = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    const ext = path.extname(file.originalname).toLowerCase();
+    const uniqueName = `${Date.now()}-${Math.round(
+      Math.random() * 1e9
+    )}${ext}`;
     cb(null, uniqueName);
-  }
+  },
 });
 
 const upload = multer({
@@ -130,18 +119,44 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const safeName = path.basename(file.originalname);
     const ext = path.extname(safeName).toLowerCase();
-    if (SUPPORTED_EXTENSIONS.includes(ext)) {
+    if (SUPPORTED_EXTENSIONS.includes(ext) && file.mimetype === PDF_MIME_TYPE) {
       cb(null, true);
     } else {
-      cb(new Error(`Unsupported file type. Allowed: ${SUPPORTED_EXTENSIONS.join(", ")}`));
+      cb(new Error("Only PDF files are supported."));
     }
-  }
+  },
 });
 
+
+const uploadSingle = (req, res, next) => {
+  upload.single("file")(req, res, (err) => {
+    if (!err) {
+      return next();
+    }
+
+    if (err instanceof multer.MulterError) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    return res.status(400).json({ error: err.message || "Invalid upload." });
+  });
+};
+
+const hasPdfMagicNumber = async (filePath) => {
+  const handle = await fs.promises.open(filePath, "r");
+  try {
+    const buffer = Buffer.alloc(4);
+    const { bytesRead } = await handle.read(buffer, 0, 4, 0);
+    return bytesRead === 4 && buffer.toString("ascii") === PDF_MAGIC;
+  } finally {
+    await handle.close();
+  }
+}
+
 // ------------------------------------------------------------------
-// ROUTE: UPLOAD PDF
+// ROUTE: UPLOAD
 // ------------------------------------------------------------------
-app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+app.post("/upload", uploadLimiter, uploadSingle, async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -154,64 +169,35 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Missing sessionId." });
     }
 
-    const filePath = path.resolve(req.file.path);
-
-    //Magic byte check to ensure it's a PDF
-    const ext = path.extname(filePath).toLowerCase();
-    const detectedType = await fileTypeFromFile(filePath);
-
-    // Handle formats differently
-    if (ext === ".pdf") {
-      if (!detectedType || detectedType.mime !== "application/pdf") {
-        fs.unlinkSync(filePath);
-        return res.status(400).json({ error: "Invalid PDF file uploaded." });
-      }
+    // **CRITICAL**: Clear session and reset backend state before processing new PDF
+    // This prevents cross-document context leakage
+    if (req.session) {
+      req.session.chatHistory = [];
+      req.session.currentPdfSessionId = null;
     }
 
-    else if (ext === ".docx") {
-      if (!detectedType || detectedType.mime !== "application/vnd.openxmlformats-officedocument.wordprocessingml.document") {
-        fs.unlinkSync(filePath);
-        return res.status(400).json({ error: "Invalid DOCX file uploaded." });
-      }
+    // Reset backend state through the /reset endpoint
+    try {
+      await axios.post("http://localhost:5000/reset");
+    } catch (resetError) {
+      console.warn("Warning: Could not reset backend state:", resetError.message);
+      // Continue with PDF upload even if reset fails
     }
 
-    else if (ext === ".txt" || ext === ".md") {
-      // file-type may return undefined for plain text (this is normal)
-      const stats = fs.statSync(filePath);
-      if (stats.size === 0) {
-        fs.unlinkSync(filePath);
-        return res.status(400).json({ error: "Uploaded file is empty." });
-      }
+    // Send PDF to Python service for processing
+    const uploadResponse = await axios.post("http://localhost:5000/process-pdf", {
+      filePath: filePath,
+    });
+
+    // Store the new PDF session ID for future validation
+    if (uploadResponse.data.session_id && req.session) {
+      req.session.currentPdfSessionId = uploadResponse.data.session_id;
     }
 
-    else {
-      fs.unlinkSync(filePath);
-      return res.status(400).json({ error: "Unsupported file type." });
-    }
-
-    //Ensure file is not empty
-    const stats = fs.statSync(filePath);
-    if (stats.size === 0) {
-      fs.unlinkSync(filePath); // Delete the empty file
-      return res.status(400).json({ error: "Uploaded PDF is empty." });
-    }
-
-    //Ensure file stays in uploads directory and is not executable
-    if (!filePath.startsWith(UPLOAD_DIR)) {
-      fs.unlinkSync(filePath);
-      return res.status(400).json({ error: "Invalid file path." });
-    }
-
-    await axios.post(
-      "http://localhost:5000/process-pdf",
-      { filePath, session_id: sessionId },
-      { timeout: API_REQUEST_TIMEOUT }
-    );
-
-    // Use filename as a fallback doc_id if one isn't returned
     res.json({
-      message: response.data.message,
-      doc_id: response.data.doc_id || req.file.filename
+      message: "PDF uploaded & processed successfully!",
+      session_id: uploadResponse.data.session_id,
+      details: uploadResponse.data
     });
   } catch (err) {
     console.error("Upload failed:", err.message);
@@ -220,23 +206,16 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 });
 
 // ------------------------------------------------------------------
-// ROUTE: ASK QUESTION
+// ROUTE: ASK
 // ------------------------------------------------------------------
 app.post("/ask", askLimiter, async (req, res) => {
   const { question, sessionId } = req.body;
 
-  // ---- Input validation ----
-  if (!sessionId) {
+  if (!sessionId)
     return res.status(400).json({ error: "Missing sessionId." });
-  }
 
-  if (!question || typeof question !== "string" || !question.trim()) {
-    return res.status(400).json({ error: "Invalid question" });
-  }
-
-  if (question.length > 2000) {
-    return res.status(400).json({ error: "Question too long" });
-  }
+  if (!question || typeof question !== "string" || !question.trim())
+    return res.status(400).json({ error: "Invalid question." });
 
   try {
     if (!req.session.chatHistory) {
@@ -276,19 +255,42 @@ app.post("/ask", askLimiter, async (req, res) => {
 app.post("/clear-history", (req, res) => {
   if (req.session) {
     req.session.chatHistory = [];
+    req.session.currentPdfSessionId = null;
   }
-  res.json({ message: "History cleared" });
+  res.json({ message: "Chat history cleared" });
+});
+
+app.get("/pdf-status", async (req, res) => {
+  try {
+    // Check backend PDF status
+    const statusResponse = await axios.get("http://localhost:5000/status");
+    
+    // Include frontend session status
+    const frontendStatus = {
+      hasSession: !!req.session,
+      hasHistory: req.session?.chatHistory?.length > 0 || false,
+      historyLength: req.session?.chatHistory?.length || 0,
+      currentSessionId: req.session?.currentPdfSessionId || null
+    };
+
+    res.json({
+      backend: statusResponse.data,
+      frontend: frontendStatus
+    });
+  } catch (err) {
+    console.error("Error fetching PDF status:", err.message);
+    res.status(500).json({ error: "Could not fetch PDF status" });
+  }
 });
 
 // ------------------------------------------------------------------
 // ROUTE: SUMMARIZE
 // ------------------------------------------------------------------
 app.post("/summarize", summarizeLimiter, async (req, res) => {
-  const { sessionId } = req.body || {};
+  const { sessionId } = req.body;
 
-  if (!sessionId) {
+  if (!sessionId)
     return res.status(400).json({ error: "Missing sessionId." });
-  }
 
   try {
     const response = await axios.post(
@@ -299,8 +301,10 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
 
     res.json({ summary: response.data.summary });
   } catch (err) {
-    console.error("Summarize failed:", err.response?.data || err.message);
-    res.status(500).json({ error: "Error summarizing PDF" });
+    if (err.code === "ECONNABORTED") {
+      return res.status(504).json({ error: "Summarization timed out" });
+    }
+    res.status(500).json({ error: "Error summarizing" });
   }
 });
 
@@ -308,22 +312,35 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
 // ROUTE: COMPARE
 // ------------------------------------------------------------------
 app.post("/compare", compareLimiter, async (req, res) => {
-  const { sessionId } = req.body;
-  if (!sessionId) {
-    return res.status(400).json({ error: "Missing sessionId." });
-  }
-
   try {
     const response = await axios.post(
       "http://localhost:5000/compare",
       req.body,
       { timeout: API_REQUEST_TIMEOUT }
     );
+
     res.json({ comparison: response.data.comparison });
   } catch (err) {
-    console.error("Compare failed:", err.response?.data || err.message);
-    res.status(500).json({ error: "Error comparing documents" });
+    res.status(500).json({ error: "Error comparing" });
   }
 });
 
-app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
+// ------------------------------------------------------------------
+// ERROR HANDLING
+// ------------------------------------------------------------------
+app.use((err, req, res, next) => {
+  if (err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({
+      error: "File too large (max 20MB).",
+    });
+  }
+  if (err.message.includes("Unsupported file type")) {
+    return res.status(400).json({ error: err.message });
+  }
+  next(err);
+});
+
+// ------------------------------------------------------------------
+app.listen(4000, () =>
+  console.log("Backend running on http://localhost:4000")
+);

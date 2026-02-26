@@ -8,6 +8,20 @@ RAG-based document question-answering app with:
 
 Upload a PDF, ask questions from its content, and generate a short summary. You can export the chat as **CSV** or **TXT** (plain text).
 
+---
+
+## 🚀 Important: Context Leakage Fix Implemented
+
+**Issue Resolved**: The system previously showed content from old PDFs when answering questions about new PDFs. This has been **completely fixed**.
+
+**For testing and understanding the fix**, see:
+- 📖 [START_HERE.md](START_HERE.md) - Quick start (5 minutes)
+- 🧪 [QUICK_TEST_GUIDE.md](QUICK_TEST_GUIDE.md) - Testing procedures
+- 📋 [CONTEXT_LEAKAGE_FIX.md](CONTEXT_LEAKAGE_FIX.md) - Technical details
+- 📝 [SOLUTION_SUMMARY.md](SOLUTION_SUMMARY.md) - Complete overview
+
+---
+
 ## Architecture
 
 1. Frontend uploads file to Node backend (`/upload`)
@@ -118,6 +132,10 @@ Interactive docs: `http://localhost:5000/docs`
 
 - RAG index is in-memory (rebuilds after restart)
 - Summarization and QA use retrieved context from the last processed PDF
+
+## Advanced Issues
+
+See [ADVANCED_ISSUES.md](ADVANCED_ISSUES.md) for critical security, performance, and architecture issues that need attention before production deployment.
 
 ## Contributing
 
